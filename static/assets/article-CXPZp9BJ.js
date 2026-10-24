@@ -1,0 +1,1 @@
+import{v as e}from"./http-nTHyapWg.js";export{e as getArticles};

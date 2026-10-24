@@ -200,7 +200,21 @@ def sync_article_content(
         return False, "missing_url"
 
     try:
-        content, mode, article_type = fetch_article_content(article_url, preferred_mode)
+        if cfg.get("gather.model") == "weread_mp" and str(article.mp_id or "").startswith("MP_WXS_"):
+            from core.wx.model.weread_mp import MpsWereadMP
+
+            origin_id = extract_origin_article_id(article.id, article.mp_id)
+            review_id = "MP_WXS_" + origin_id
+            if not review_id.startswith(article.mp_id + "_"):
+                raise ValueError("article ID cannot be mapped to a WeRead reviewId")
+            wx = MpsWereadMP()
+            wx._load_weread_auth()
+            content = wx._get_mp_content(review_id)
+            mode, article_type = "weread_mp", ""
+            if not is_usable_article_content(content):
+                content = ""
+        else:
+            content, mode, article_type = fetch_article_content(article_url, preferred_mode)
     except ProcessExecutionTimeout as exc:
         mark_article_fetch_failed(session, article, str(exc))
         return False, "timeout"

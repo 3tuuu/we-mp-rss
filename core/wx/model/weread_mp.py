@@ -3,6 +3,7 @@
 import time
 from urllib.parse import quote
 
+import requests
 from bs4 import BeautifulSoup
 
 from core.log import logger
@@ -68,7 +69,7 @@ def _raise_response_error(payload: dict):
     raise WereadMPAPIError(
         code,
         message,
-        retriable=code not in (-2041, -2012, -2010),
+        retriable=code not in (-2041, -2013, -2012, -2010),
     )
 
 
@@ -308,20 +309,48 @@ class MpsWereadMP(MpsWeread):
             session.close()
 
     def _get_mp_content(self, review_id: str):
+        auth_retried = False
+        # Retry only transient transport/server failures, never expired credentials.
+        for attempt in range(2):
+            try:
+                return self._get_mp_content_once(review_id)
+            except WereadMPAPIError as exc:
+                if str(exc.code) in ("401", "-2012", "-2013", "-2010") and not auth_retried:
+                    from core.wx.model.weread_mobile import refresh_web
+                    auth_retried = True
+                    renewed = refresh_web(failed_cookie=self._weread_cookies)
+                    if renewed and renewed != self._weread_cookies:
+                        self._weread_cookies = renewed
+                        return self._get_mp_content_once(review_id)
+                if attempt or exc.code not in ("network_error", 429, 500, 502, 503, 504):
+                    raise
+                time.sleep(3)
+
+    def _get_mp_content_once(self, review_id: str):
+        headers = self._request_headers()
+        headers["Accept"] = "text/html,application/xhtml+xml,*/*"
         try:
-            response = self._weread_http_get(
+            response = requests.get(
                 f"{WEREAD_WEB_BASE}/web/mp/content",
-                params={"reviewId": review_id},
+                params={"reviewId": review_id}, headers=headers,
+                proxies=self._get_proxies(), timeout=(10, 30),
             )
-        except Exception as exc:
-            if isinstance(exc, WereadMPAPIError):
-                raise
+        except requests.RequestException as exc:
             raise WereadMPAPIError("network_error", str(exc)) from exc
         if response.status_code != 200:
             raise WereadMPAPIError(
                 response.status_code,
                 f"article content returned HTTP {response.status_code}",
             )
+        # HTTP 200 can contain a JSON authentication error rather than HTML.
+        if response.text.lstrip().startswith(("{", "[")):
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise WereadMPAPIError("invalid_json", "invalid content response", False) from exc
+            if isinstance(payload, dict):
+                _raise_response_error(payload)
+            raise WereadMPAPIError("invalid_content", "content endpoint returned JSON instead of HTML", False)
         return extract_mp_content(response.text)
 
     def _collect_latest_via_cover(
@@ -376,6 +405,7 @@ class MpsWereadMP(MpsWeread):
                 item["content"] = self._get_mp_content(review_id)
             except WereadMPAPIError as exc:
                 logger.warning(f"微信读书正文获取失败 [{review_id}]: {exc}")
+                raise
         if CallBack is not None:
             super().FillBack(
                 CallBack=CallBack,
@@ -488,6 +518,124 @@ class MpsWereadMP(MpsWeread):
         print_info(f"[{Mps_title}] 增量补抓完成: 新增 {new_count} 篇")
         return latest_publish_time or previous_update_time
 
+    def _backfill_missing_content(self, mp_id: str, limit: int = 3):
+        """Repair existing empty rows without deleting or re-publishing articles."""
+        from sqlalchemy import func, or_
+        from core.db import DB
+        from core.models.article import Article
+        from tools.fix import fix_html, sanitize_utf8
+
+        def missing():
+            return or_(Article.content.is_(None), func.length(func.trim(Article.content)) == 0)
+
+        def unlocked():
+            return or_(Article.fetch_started_at.is_(None), Article.fetch_started_at == 0)
+
+        session = DB.get_session()
+        try:
+            rows = session.query(Article.id).filter(
+                Article.mp_id == mp_id, Article.status == 1, missing(), unlocked(),
+            ).order_by(Article.created_at.desc()).limit(limit).all()
+        finally:
+            session.close()
+
+        prefix = f"{mp_id}-".replace("MP_WXS_", "")
+        recovered = 0
+        self.backfill_errors = []
+        for (article_id,) in rows:
+            if not article_id.startswith(prefix):
+                continue
+            review_id = "MP_WXS_" + article_id[len(prefix):]
+            if not review_id.startswith(mp_id + "_"):
+                continue
+            time.sleep(self._get_content_interval())
+            try:
+                content = sanitize_utf8(self._get_mp_content(review_id))
+            except WereadMPAPIError as exc:
+                # A removed/shell-only historical article must not starve other
+                # rows. Authentication/network failures still stop this batch.
+                if exc.code != "invalid_content":
+                    raise
+                from core.article_content import mark_article_fetch_failed
+                session = DB.get_session()
+                try:
+                    row = session.query(Article).filter(
+                        Article.id == article_id, Article.status == 1, missing(), unlocked(),
+                    ).first()
+                    if row is not None:
+                        mark_article_fetch_failed(session, row, str(exc))
+                finally:
+                    session.close()
+                self.backfill_errors.append({"id": article_id, "code": exc.code})
+                continue
+            if not content.strip():
+                raise WereadMPAPIError("invalid_content", "empty article body", False)
+            session = DB.get_session()
+            try:
+                recovered += session.query(Article).filter(
+                    Article.id == article_id, Article.status == 1, missing(), unlocked(),
+                ).update({
+                    Article.content: content, Article.content_html: fix_html(content),
+                    Article.has_content: 1, Article.fix_fail_count: 0,
+                    Article.updated_at: int(time.time()),
+                    Article.updated_at_millis: int(time.time() * 1000),
+                }, synchronize_session=False)
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+        self.recovered_content_count = recovered
+        if recovered:
+            print_info(f"微信读书补齐正文: {mp_id}, {recovered}篇")
+        return recovered
+
+    def _collect_mobile_history(self, book_id, name, callback, max_pages=5,
+                                page_size=20, offset=0, stop_when_known=True):
+        from core.wx.model.weread_mobile import MobileClient, MobileError
+        client = MobileClient()
+        seen = set()
+        latest = self._get_feed_update_time(book_id)
+        start_count = len(self.articles)
+        has_more = True
+        stop_reason = "page_limit"
+        for page_number in range(max_pages):
+            page = client.page(book_id, offset, page_size)
+            rows = page["items"]
+            if rows and all(row["reviewId"] in seen for row in rows):
+                raise MobileError("repeated_page", "历史接口重复返回同一页，已停止")
+            all_known = bool(rows)
+            for row in rows:
+                rid = row["reviewId"]
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                if self._is_article_gathered(book_id, rid):
+                    continue
+                all_known = False
+                item = {"aid": rid, "id": rid, "mp_id": book_id, "title": row["title"],
+                        "link": build_mp_link_from_review_id(rid, book_id), "cover": row["pic"],
+                        "digest": row["digest"], "content": "", "create_time": row["time"],
+                        "update_time": row["time"], "item_show_type": 0, "copyright_stat": 1}
+                if callback is not None:
+                    super().FillBack(CallBack=callback, data=item,
+                                     Ext_Data={"mp_title": name, "mp_id": book_id})
+                latest = max(latest, row["time"])
+            offset, has_more = page["next_offset"], page["has_more"]
+            if not has_more:
+                stop_reason = "end"
+                break
+            if stop_when_known and all_known:
+                stop_reason = "known_page"
+                break
+            if page_number + 1 < max_pages:
+                time.sleep(max(2, self._get_page_interval()))
+        self.update_mps(book_id, Feed(sync_time=int(time.time()), update_time=latest or None))
+        self.response_valid = True
+        return {"collected": len(self.articles) - start_count, "next_offset": offset,
+                "has_more": has_more, "stop_reason": stop_reason}
+
     def get_Articles(
         self,
         faker_id: str = None,
@@ -503,7 +651,7 @@ class MpsWereadMP(MpsWeread):
     ):
         """Collect one existing WeChat feed without changing its RSS identity.
 
-        主路径走 ``/web/mp/articles`` 列表接口做增量补抓：从最新一页开始翻页，
+        移动端已授权时优先 mp/chapters 分页；否则保留 Web 列表增量补抓：从最新一页开始翻页，
         采集所有尚未入库的文章，遇到已入库文章即停止（上一轮到这一轮之间漏采的
         文章会一并补齐）。列表接口不可用（如 -2012 登录超时 / -2041 等）时回退到
         ``/api/mp/cover`` 只取最新一篇的兜底逻辑，保证采集不中断。
@@ -546,6 +694,28 @@ class MpsWereadMP(MpsWeread):
 
         print_info(f"微信读书公众号采集模式: {Mps_title} ({book_id})")
         try:
+            # New feeds and existing add/update jobs share mobile pagination.
+            from core.wx.model.weread_mobile import MobileClient, MobileError, load_state, save_state
+            if MobileClient().enabled(book_id):
+                try:
+                    from core.config import cfg
+                    page_limit = min(10, max(1, int(cfg.get("weread.mobile_max_pages", 5) or 5)))
+                    self.history_result = self._collect_mobile_history(book_id, Mps_title, CallBack, max_pages=page_limit)
+                    if gather_content:
+                        self._backfill_missing_content(Mps_id)
+                    super().Over(CallBack=Over_CallBack)
+                    return
+                except MobileError as exc:
+                    self.history_error = str(exc)
+                    state = load_state()
+                    error = {"code": exc.code, "message": str(exc), "mp_id": book_id,
+                             "cooldown_until": int(time.time()) + 300}
+                    state["last_error"] = error
+                    state.setdefault("feed_errors", {})[book_id] = error
+                    save_state(state)
+                    logger.warning(f"历史分页失败，暂回退最新一篇: {exc}")
+            if gather_content:
+                self._backfill_missing_content(Mps_id)
             try:
                 latest_publish_time = self._collect_via_article_list(
                     book_id,

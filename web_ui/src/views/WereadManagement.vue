@@ -1,6 +1,9 @@
 <template>
   <div class="weread-management">
     <a-card title="微信读书管理" :bordered="false">
+      <WereadMobilePanel @web-auth="showQrAuth" />
+      <a-collapse>
+        <a-collapse-item key="web-config" header="Web 正文高级配置（手动 Cookie / 浏览器刷新）">
       <!-- Cookie 配置区域 -->
       <a-divider orientation="left">连接配置</a-divider>
       <a-alert v-if="connectionStatus === 'loading'" type="info" :show-icon="false">
@@ -121,6 +124,8 @@
         </a-space>
       </a-form>
 
+        </a-collapse-item>
+      </a-collapse>
       <!-- 书架区域 -->
       <a-divider v-if="!isWereadMp" orientation="left">我的书架</a-divider>
       <a-spin v-if="!isWereadMp" :loading="loadingBookshelf" tip="加载书架...">
@@ -209,6 +214,7 @@ import {
   clearWereadCookie,
 } from '@/api/weread'
 import WereadAuthQrcode from '@/components/WereadAuthQrcode.vue'
+import WereadMobilePanel from '@/components/WereadMobilePanel.vue'
 
 // 状态
 const connectionStatus = ref<'idle' | 'loading' | 'success' | 'error'>('idle')

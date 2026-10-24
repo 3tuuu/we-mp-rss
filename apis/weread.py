@@ -16,6 +16,8 @@ from core.config import Config, cfg as app_cfg
 from driver.weread_qr import WereadQRLogin
 
 router = APIRouter(prefix="/weread", tags=["微信读书"])
+from apis.weread_mobile_api import router as mobile_router
+router.include_router(mobile_router)
 
 
 class WereadCookieRequest(BaseModel):
@@ -321,6 +323,7 @@ async def test_weread_mp_connection(
         cover = wx._get_mp_cover(mp_id)
         review_id = cover.get("reviewId", "")
         article_count = 1 if review_id else 0
+        content = wx._get_mp_content(review_id) if review_id else ""
     except WereadMPAPIError as exc:
         return error_response(400, str(exc), {
             "code": exc.code,
@@ -332,7 +335,9 @@ async def test_weread_mp_connection(
         "mp_name": cover.get("name", ""),
         "latest_title": cover.get("title", ""),
         "article_count": article_count,
-    }, "公众号采集凭据有效")
+        "content_valid": bool(content.strip()),
+        "content_chars": len(content),
+    }, "公众号最新文章与正文连接验证通过")
 
 
 @router.post("/bookshelf", summary="获取书架书籍列表")

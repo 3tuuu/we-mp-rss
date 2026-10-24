@@ -69,7 +69,7 @@ def do_job(mp=None,task:MessageTask=None,isTest=False):
                 wx = WxGather().Model()
                 # 微信读书公众号（MP_WXS_*）自动改用 weread_mp 采集器：
                 # 只有微信读书 Cookie 已配置时才启用，否则该 feed 无法用默认模式采集
-                if str(mp.id or "").startswith("MP_WXS_") and mp.id != "MP_WXS_FEATURED_ARTICLES":
+                if cfg.get("gather.model") == "weread_mp" and str(mp.id or "").startswith("MP_WXS_") and mp.id != "MP_WXS_FEATURED_ARTICLES":
                     from core.wx.model.weread_mp import MpsWereadMP
                     _mp_wx = MpsWereadMP()
                     _mp_wx._load_weread_auth()
